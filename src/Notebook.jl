@@ -422,8 +422,8 @@ function analyze_cdr3(cdr3_seq::LongSequence{DNAAlphabet{4}},
     println()
     
     # Build loop models: full (≥2 allowed) vs constrained (≤1)
-    hmm_full, info_full = build_full_loop_model(d_genes; p_stay_n=0.6, p_continue_d=0.95, p_direct_d_end=0.01, match_prob=0.85)
-    hmm_oneD, info_oneD = build_oneD_loop_model(d_genes; p_stay_n=0.6, p_continue_d=0.95, match_prob=0.85)
+    hmm_full, info_full = build_full_loop_model(d_genes; p_stay_n=0.75, p_continue_d=0.95, p_direct_d_end=0.01, match_prob=0.85)
+    hmm_oneD, info_oneD = build_oneD_loop_model(d_genes; p_stay_n=0.75, p_continue_d=0.95, match_prob=0.85)
     
     loglik_full = logdensityof(hmm_full, obs_seq)
     loglik_oneD = logdensityof(hmm_oneD, obs_seq)
@@ -497,11 +497,5 @@ end
 
 d_genes = load_sequences("data/KI+1KGP-IGHD-SHORT.fasta")
 
-cdr3_seq = dna"GCGAGAGATAATCGCTATTACGATTTTTGGAGTGGTTATTCTTCGGGTTACTACTACTACTACTACTACATGGACGTC"
-#cdr3_seq = dna"AATTATTGTGGTGGTGATTGCTATGCGAATGTATAGCAGTGGCTGATGC"
-#cdr3_seq = dna"TGTGCGAGTTGGGGGAGTTATCGTCATAACGGCTATTACTATTATAGTAGTGGTTATGAATGGTTCTACTACGGTATTGACGTCTGG"
-cdr3_seq = dna"GCGAGAGAGGAGATGGCTACAATTTCTGGTTACTACTACGGTATGGACGTC"
+cdr3_seq = dna"AATTATTGTGGTGGTGATTGCTATGCGAATGTATAGCAGTGGCTGATGC"
 results = analyze_cdr3(cdr3_seq, d_genes)
-#GCGAGAGATAATCGCTATTACGATTTTTGGAGTGGTTATTCTTCGGGTTACTACTACTACTACTACTACATGGACGTC
-# CGAGAGAT
-#              CTATTACGATTTTTGGAGTGGTTATT
