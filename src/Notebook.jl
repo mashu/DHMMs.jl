@@ -10,86 +10,59 @@ function load_sequences(file::String)
     end
     return records
 end
+# ============================================================================
+# Helper functions
+# ============================================================================
 
 function dna_to_int(nt::DNA)
-    if nt == DNA_A
-        return 1
-    elseif nt == DNA_C
-        return 2
-    elseif nt == DNA_G
-        return 3
-    elseif nt == DNA_T
-        return 4
-    else
-        error("Unknown nucleotide: $nt")
-    end
+    nt == DNA_A && return 1
+    nt == DNA_C && return 2
+    nt == DNA_G && return 3
+    nt == DNA_T && return 4
+    error("Unknown nucleotide: $nt")
 end
-seq_to_ints(seq::LongSequence{DNAAlphabet{4}}) = dna_to_int.(seq)
 
-# ============================================================================
-# Emission distribution for a position in D gene
-# Match nucleotide gets high probability, others share the rest
-# ============================================================================
+seq_to_ints(seq::LongSequence{DNAAlphabet{4}}) = [dna_to_int(nt) for nt in seq]
 
 function match_emission(expected_nt::DNA; match_prob=0.85)
-    # Probability distribution over {A=1, C=2, G=3, T=4}
     probs = fill((1 - match_prob) / 3, 4)
     probs[dna_to_int(expected_nt)] = match_prob
     return Categorical(probs)
 end
 
-# Uniform emission for N-region
 uniform_emission() = Categorical([0.25, 0.25, 0.25, 0.25])
 
 # ============================================================================
 # MODEL A: Single D gene model (N → D → N)
-# 
-# States:
-#   1: N_start (N-region before D)
-#   2 to 1+sum(lengths): D gene positions (flattened across all D genes)
-#   last: N_end (N-region after D)
-#
-# Structure allows: N_start → any_D_start → through_D → N_end
-#                   or N_start → N_end (skip D entirely)
 # ============================================================================
 
 function build_single_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlphabet{4}}}};
-                               p_stay_n=0.7,      # Probability to stay in N region
-                               p_enter_d=0.25,    # Base prob to enter a D gene
-                               p_continue_d=0.9,  # Prob to continue along D gene
-                               match_prob=0.85)   # Emission match probability
+                               p_stay_n=0.6,
+                               p_skip_d=0.05,
+                               p_continue_d=0.9,
+                               match_prob=0.85)
     
     d_lengths = [length(seq) for (_, seq) in d_genes]
     n_d_genes = length(d_genes)
     total_d_positions = sum(d_lengths)
     
-    # State indexing:
-    # 1: N_start
-    # 2 to 1+total_d_positions: D positions
-    # 2+total_d_positions: N_end
     n_states = 2 + total_d_positions
-    
-    # Map D gene index and position to state number
-    d_state_offset = 1  # N_start is state 1
-    d_gene_starts = cumsum([0; d_lengths[1:end-1]]) .+ 2  # Starting state for each D gene
-    
+    d_gene_starts = cumsum([0; d_lengths[1:end-1]]) .+ 2
     n_end_state = n_states
     
-    # Build transition matrix
     trans = zeros(n_states, n_states)
     
-    # N_start transitions
-    p_skip = 0.05  # Small probability to skip D entirely
-    p_to_d_total = 1.0 - p_stay_n - p_skip
+    # N_start: stay, skip to N_end, or enter any D
+    p_to_d_total = 1.0 - p_stay_n - p_skip_d
     p_per_d = p_to_d_total / n_d_genes
     
     trans[1, 1] = p_stay_n
-    trans[1, n_end_state] = p_skip
-    for (i, start_state) in enumerate(d_gene_starts)
+    trans[1, n_end_state] = p_skip_d
+    for start_state in d_gene_starts
         trans[1, start_state] = p_per_d
     end
     
-    # D gene transitions (within each D gene)
+    # D gene transitions
     for (d_idx, (_, d_seq)) in enumerate(d_genes)
         d_len = length(d_seq)
         start_state = d_gene_starts[d_idx]
@@ -97,24 +70,20 @@ function build_single_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
         for pos in 1:d_len
             current_state = start_state + pos - 1
             if pos < d_len
-                # Can continue to next position or exit to N_end
                 trans[current_state, current_state + 1] = p_continue_d
                 trans[current_state, n_end_state] = 1.0 - p_continue_d
             else
-                # Last position: must go to N_end
                 trans[current_state, n_end_state] = 1.0
             end
         end
     end
     
-    # N_end transitions (absorbing)
     trans[n_end_state, n_end_state] = 1.0
     
-    # Build emission distributions
+    # Emissions
     dists = Vector{Categorical{Float64, Vector{Float64}}}(undef, n_states)
-    
-    dists[1] = uniform_emission()  # N_start
-    dists[n_end_state] = uniform_emission()  # N_end
+    dists[1] = uniform_emission()
+    dists[n_end_state] = uniform_emission()
     
     for (d_idx, (_, d_seq)) in enumerate(d_genes)
         start_state = d_gene_starts[d_idx]
@@ -123,11 +92,10 @@ function build_single_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
         end
     end
     
-    # Initial distribution: start in N_start
     init = zeros(n_states)
     init[1] = 1.0
     
-    # Build state info for decoding
+    # State info
     state_info = Vector{Tuple{Symbol, String, Int}}(undef, n_states)
     state_info[1] = (:N_start, "", 0)
     state_info[n_end_state] = (:N_end, "", 0)
@@ -135,7 +103,7 @@ function build_single_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
     for (d_idx, (d_name, d_seq)) in enumerate(d_genes)
         start_state = d_gene_starts[d_idx]
         for pos in 1:length(d_seq)
-            state_info[start_state + pos - 1] = (:D1, d_name, pos)
+            state_info[start_state + pos - 1] = (:D, d_name, pos)
         end
     end
     
@@ -143,19 +111,11 @@ function build_single_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
 end
 
 # ============================================================================
-# MODEL B: Double D gene model (N → D₁ → N → D₂ → N)
-#
-# States:
-#   1: N_start
-#   2 to 1+total_d_pos: D1 positions (first D usage)
-#   2+total_d_pos: N_middle
-#   3+total_d_pos to 2+2*total_d_pos: D2 positions (second D usage)
-#   3+2*total_d_pos: N_end
+# MODEL B: Double D gene model (N → D₁ → N → D₂ → N) - FIXED
 # ============================================================================
 
 function build_double_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlphabet{4}}}};
-                               p_stay_n=0.7,
-                               p_enter_d=0.25,
+                               p_stay_n=0.6,
                                p_continue_d=0.9,
                                match_prob=0.85)
     
@@ -163,41 +123,26 @@ function build_double_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
     n_d_genes = length(d_genes)
     total_d_positions = sum(d_lengths)
     
-    # State indexing:
-    # 1: N_start
-    # 2 to 1+total_d_positions: D1 positions
-    # 2+total_d_positions: N_middle
-    # 3+total_d_positions to 2+2*total_d_positions: D2 positions
-    # 3+2*total_d_positions: N_end
-    
     n_states = 3 + 2 * total_d_positions
     
     n_start = 1
-    d1_start_offset = 1
     d1_gene_starts = cumsum([0; d_lengths[1:end-1]]) .+ 2
-    
     n_middle = 2 + total_d_positions
-    
-    d2_start_offset = n_middle
     d2_gene_starts = cumsum([0; d_lengths[1:end-1]]) .+ n_middle .+ 1
-    
     n_end = n_states
     
-    # Build transition matrix
     trans = zeros(n_states, n_states)
     
-    # N_start transitions → D1 or skip to N_middle
-    p_skip_d1 = 0.1
-    p_to_d1_total = 1.0 - p_stay_n - p_skip_d1
+    # N_start → D1 (no skip allowed - must use at least one D in this model)
+    p_to_d1_total = 1.0 - p_stay_n
     p_per_d1 = p_to_d1_total / n_d_genes
     
     trans[n_start, n_start] = p_stay_n
-    trans[n_start, n_middle] = p_skip_d1
     for start_state in d1_gene_starts
         trans[n_start, start_state] = p_per_d1
     end
     
-    # D1 transitions
+    # D1 → N_middle
     for (d_idx, (_, d_seq)) in enumerate(d_genes)
         d_len = length(d_seq)
         start_state = d1_gene_starts[d_idx]
@@ -213,9 +158,10 @@ function build_double_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
         end
     end
     
-    # N_middle transitions → D2 or skip to N_end
-    p_skip_d2 = 0.3  # Higher prob to skip second D (makes single D more likely by default)
-    p_to_d2_total = 1.0 - p_stay_n - p_skip_d2
+    # N_middle → D2 or N_end (THIS WAS THE BUG!)
+    # Fixed: allocate probability properly
+    p_skip_d2 = 0.1   # Small prob to skip D2
+    p_to_d2_total = 1.0 - p_stay_n - p_skip_d2  # = 0.3 (not 0!)
     p_per_d2 = p_to_d2_total / n_d_genes
     
     trans[n_middle, n_middle] = p_stay_n
@@ -224,7 +170,7 @@ function build_double_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
         trans[n_middle, start_state] = p_per_d2
     end
     
-    # D2 transitions
+    # D2 → N_end
     for (d_idx, (_, d_seq)) in enumerate(d_genes)
         d_len = length(d_seq)
         start_state = d2_gene_starts[d_idx]
@@ -240,17 +186,14 @@ function build_double_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
         end
     end
     
-    # N_end (absorbing)
     trans[n_end, n_end] = 1.0
     
-    # Build emission distributions
+    # Emissions
     dists = Vector{Categorical{Float64, Vector{Float64}}}(undef, n_states)
-    
     dists[n_start] = uniform_emission()
     dists[n_middle] = uniform_emission()
     dists[n_end] = uniform_emission()
     
-    # D1 emissions
     for (d_idx, (_, d_seq)) in enumerate(d_genes)
         start_state = d1_gene_starts[d_idx]
         for (pos, nt) in enumerate(d_seq)
@@ -258,7 +201,6 @@ function build_double_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
         end
     end
     
-    # D2 emissions (same as D1)
     for (d_idx, (_, d_seq)) in enumerate(d_genes)
         start_state = d2_gene_starts[d_idx]
         for (pos, nt) in enumerate(d_seq)
@@ -266,11 +208,10 @@ function build_double_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
         end
     end
     
-    # Initial distribution
     init = zeros(n_states)
     init[n_start] = 1.0
     
-    # State info for decoding
+    # State info
     state_info = Vector{Tuple{Symbol, String, Int}}(undef, n_states)
     state_info[n_start] = (:N_start, "", 0)
     state_info[n_middle] = (:N_middle, "", 0)
@@ -290,7 +231,6 @@ function build_double_d_model(d_genes::Vector{Tuple{String, LongSequence{DNAAlph
         end
     end
     
-    # Store d2_gene_starts for probability calculation
     d2_state_range = (n_middle + 1):(n_end - 1)
     
     return HMM(init, trans, dists), state_info, d2_state_range
@@ -305,7 +245,7 @@ d_genes = load_sequences("data/KI+1KGP-IGHD-SHORT.fasta")
 hmm_single, state_info_single = build_single_d_model(d_genes)
 hmm_double, state_info_double, d2_states = build_double_d_model(d_genes)
 
-# cdr3_seq = dna"GCGAGAGATAATCGCTATTACGATTTTTGGAGTGGTTATTCTTCGGGTTACTACTACTACTACTACTACATGGACGTC"
+cdr3_seq = dna"GCGAGAGATAATCGCTATTACGATTTTTGGAGTGGTTATTCTTCGGGTTACTACTACTACTACTACTACATGGACGTC"
 cdr3_seq = dna"AATTATTGTGGTGGTGATTGCTATGCGAATGTATAGCAGTGGCTGATGC"
 obs_seq = seq_to_ints(cdr3_seq)
 
@@ -421,9 +361,3 @@ end
 println()
 println("Number of D segments found: ", length(d_genes_found))
 
-#              GTATTACGATTTTTGGAGTGGTTATTATACC # Full D3-3*01
-#              CTATTACGATTTTTGGAGTGGTTATT      # Partial D3-3*01 from viterbi
-#GCGAGAGATAATCGCTATTACGATTTTTGGAGTGGTTATTCTTCGGGTTACTACTACTACTACTACTACATGGACGTC
-#             GTATTACTATGATAGT AGTGGTTATT ACTAC # IGHD3-22*01
-#
-# YYDFWSGY,SSGYYY
