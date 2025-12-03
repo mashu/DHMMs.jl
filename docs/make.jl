@@ -6,6 +6,7 @@ makedocs(
     modules = [DHMMs],
     pages = [
         "Home" => "index.md",
+        "Example" => "example.md",
         "API" => "api.md",
     ],
     warnonly = [:missing_docs],
