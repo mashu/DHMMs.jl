@@ -1,6 +1,6 @@
 using Test
 using DHMMs
-using HiddenMarkovModels: logdensityof
+using HiddenMarkovModels: logdensityof, viterbi
 
 @testset "DHMMs" begin
     # Simple patterns (DNA-like: 1=A, 2=C, 3=G, 4=T)
@@ -74,20 +74,49 @@ using HiddenMarkovModels: logdensityof
         @test s.stop == 5
     end
 
-    @testset "Show methods" begin
+    @testset "Viterbi" begin
+        obs = [1, 2, 3, 4, 4]
         m = SegmentHMM(LoopMode(), patterns)
+        result = viterbi(m, obs)
+        @test length(result[1]) == length(obs)
+        @test result isa Tuple
+    end
+
+    @testset "Show methods" begin
+        # Test all modes for full coverage
+        m_null = SegmentHMM(NullMode(), patterns)
+        m_single = SegmentHMM(SingleMode(), patterns)
+        m_loop = SegmentHMM(LoopMode(), patterns)
         
-        # Compact show
+        # NullMode show
         buf = IOBuffer()
-        show(buf, m)
-        @test occursin("SegmentHMM", String(take!(buf)))
+        show(buf, MIME"text/plain"(), m_null)
+        @test occursin("N ⟲", String(take!(buf)))
         
-        # Full show
+        # SingleMode show
         buf = IOBuffer()
-        show(buf, MIME"text/plain"(), m)
+        show(buf, MIME"text/plain"(), m_single)
+        @test occursin("N₀", String(take!(buf)))
+        
+        # LoopMode show
+        buf = IOBuffer()
+        show(buf, MIME"text/plain"(), m_loop)
         output = String(take!(buf))
-        @test occursin("patterns", output)
-        @test occursin("states", output)
+        @test occursin("⇄", output)
+        @test occursin("Patterns", output)
+        
+        # Compact show - test all modes to cover mode_name
+        buf = IOBuffer()
+        show(buf, m_null)
+        @test occursin("Null", String(take!(buf)))
+        
+        buf = IOBuffer()
+        show(buf, m_single)
+        @test occursin("Single", String(take!(buf)))
+        
+        buf = IOBuffer()
+        show(buf, m_loop)
+        @test occursin("Loop", String(take!(buf)))
     end
 
     @testset "Empty observations" begin
