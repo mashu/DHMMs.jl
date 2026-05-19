@@ -1,6 +1,7 @@
 using Test
 using DHMMs
-using DHMMs: trim_pmf
+using DHMMs: trim_pmf, Background, Match, Insert,
+             segment_kind, pattern_idx, profile_pos
 using HiddenMarkovModels: HMM, logdensityof, viterbi, forward_backward
 using SparseArrays: SparseMatrixCSC, nnz
 
@@ -26,10 +27,11 @@ using SparseArrays: SparseMatrixCSC, nnz
         m_loop   = SegmentHMM(LoopMode(), patterns)
 
         @test length(m_null.states)   == 1
-        @test length(m_single.states) == 2 + 2 * (3 + 4)   # 2 N + 2L per pattern
+        @test length(m_single.states) == 2 + 2 * (3 + 4)
         @test length(m_loop.states)   == 1 + 2 * (3 + 4)
-        @test count(s -> s[1] === :M, m_single.states) == 3 + 4
-        @test count(s -> s[1] === :I, m_single.states) == 3 + 4
+        @test count(s -> s isa Match,  m_single.states) == 3 + 4
+        @test count(s -> s isa Insert, m_single.states) == 3 + 4
+        @test count(s -> s isa Background, m_single.states) == 2
     end
 
     @testset "trim_pmf" begin
@@ -43,20 +45,27 @@ using SparseArrays: SparseMatrixCSC, nnz
     end
 
     @testset "Profile state layout" begin
-        # LoopMode, patterns = [[1,2,3], [3,3,1,2]]
-        # Layout: state 1 = N, then for pattern 1 (L=3):
-        #   2 M_{1,1}, 3 I_{1,1}, 4 M_{1,2}, 5 I_{1,2}, 6 M_{1,3}, 7 I_{1,3}
-        # Then for pattern 2 (L=4):
-        #   8 M_{2,1}, 9 I_{2,1}, ..., 14 M_{2,4}, 15 I_{2,4}
+        # LoopMode, patterns = [[1,2,3], [3,3,1,2]]:
+        # state 1 = Background; pattern 1 (L=3) at states 2..7 (M_1, I_1, ...,
+        # M_3, I_3); pattern 2 (L=4) at states 8..15.
         m = SegmentHMM(LoopMode(), patterns)
-        @test m.states[1] == (:N, 0, 0)
-        @test m.states[2] == (:M, 1, 1)
-        @test m.states[3] == (:I, 1, 1)
-        @test m.states[6] == (:M, 1, 3)
-        @test m.states[7] == (:I, 1, 3)
-        @test m.states[8] == (:M, 2, 1)
-        @test m.states[14] == (:M, 2, 4)
-        @test m.states[15] == (:I, 2, 4)
+        @test m.states[1]  == Background()
+        @test m.states[2]  == Match(1, 1)
+        @test m.states[3]  == Insert(1, 1)
+        @test m.states[6]  == Match(1, 3)
+        @test m.states[7]  == Insert(1, 3)
+        @test m.states[8]  == Match(2, 1)
+        @test m.states[14] == Match(2, 4)
+        @test m.states[15] == Insert(2, 4)
+
+        # Dispatched accessors
+        @test segment_kind(m.states[1]) === :N
+        @test segment_kind(m.states[2]) === :P
+        @test segment_kind(m.states[3]) === :P
+        @test pattern_idx(m.states[1])  == 0
+        @test pattern_idx(m.states[8])  == 2
+        @test profile_pos(m.states[1])  == 0
+        @test profile_pos(m.states[14]) == 4
     end
 
     @testset "p_5trim = 0 concentrates entry at first match state only" begin
@@ -309,17 +318,14 @@ using SparseArrays: SparseMatrixCSC, nnz
     end
 
     @testset "Per-pattern posterior aggregation" begin
-        obs = [4, 4, 1, 2, 3, 4, 4]  # background then ACG then background
+        obs = [4, 4, 1, 2, 3, 4, 4]
         m = SegmentHMM(LoopMode(), [[1, 2, 3]]; match_prob=0.99)
         γ, _ = forward_backward(m, obs)
-        # Build per-pattern occupancy by summing M and I rows for pattern 1.
         p_pat1 = zeros(length(obs))
         for (s, info) in enumerate(m.states)
-            (info[1] === :M || info[1] === :I) && info[2] == 1 || continue
+            pattern_idx(info) == 1 || continue
             p_pat1 .+= γ[s, :]
         end
-        # Middle of the ACG hit (position 4) should have higher pattern-1
-        # occupancy than position 1 (pure background).
         @test p_pat1[4] > p_pat1[1]
     end
 
@@ -375,9 +381,9 @@ using SparseArrays: SparseMatrixCSC, nnz
         @test decode(m, Int32[1, 2, 3, 4, 4]) isa Vector{Segment}
     end
 
-    @testset "Type stability of state metadata" begin
+    @testset "State elements are StateInfo subtypes" begin
         m = SegmentHMM(LoopMode(), Vector{Int}[[1, 2], [3, 4]])
         @test m.pattern_lengths == [2, 2]
-        @test all(s -> s isa Tuple{Symbol, Int, Int}, m.states)
+        @test all(s -> s isa Union{Background, Match, Insert}, m.states)
     end
 end

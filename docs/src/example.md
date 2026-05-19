@@ -141,13 +141,16 @@ at every position. Aggregate state rows by pattern to get a per-D occupancy
 track:
 
 ```julia
+using DHMMs: pattern_idx  # dispatched accessor; works on Match / Insert / Background
+
 γ, _ = forward_backward(m_loop, obs)
 
 n_pat = length(all_patterns)
 p_per_d = zeros(n_pat, length(obs))
 for (s, info) in enumerate(m_loop.states)
-    (info[1] === :M || info[1] === :I) || continue
-    p_per_d[info[2], :] .+= γ[s, :]
+    i = pattern_idx(info)
+    i == 0 && continue
+    p_per_d[i, :] .+= γ[s, :]
 end
 # p_per_d[i, t] = P(position t is inside D_i)
 ```
