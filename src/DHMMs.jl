@@ -1,7 +1,12 @@
 """
     DHMMs
 
-Segment detection Hidden Markov Models built on HiddenMarkovModels.jl.
+Segment-detection profile HMMs built on HiddenMarkovModels.jl.
+
+Each pattern is a profile HMM segment with match (`M`), insert (`I`), and
+(silent, marginalised) delete states. 5'- and 3'-truncation are modelled by
+geometric trim priors. See the documentation for the topology and the
+statistical model.
 """
 module DHMMs
 
@@ -33,24 +38,23 @@ struct NullMode <: ModelMode end
 """
     SingleMode <: ModelMode
 
-Single pattern model. Topology: `N₀ ⟲ → Pᵢ → N₁ ⟲`
+Single profile-HMM pattern segment. Topology: `N₀ ⟲ → profileᵢ → N₁ ⟲`
 
-Allows at most one pattern segment with optional skip. 5'/3' trimming of the
-pattern is modelled by geometric distributions over entry and exit positions
-(see `p_5trim`, `p_3trim`).
+At most one (possibly trimmed) pattern instance per observation.
 """
 struct SingleMode <: ModelMode end
 
 """
     LoopMode <: ModelMode
 
-Loop model allowing multiple patterns. Topology: `N ⟲ ⇄ Pᵢ`
+Multiple profile-HMM pattern segments. Topology: `N ⟲ ⇄ profileᵢ`
 
-Multiple pattern instances are separated by at least one background emission.
-Trimming is modelled by `p_5trim` and `p_3trim`.
+Multiple instances may be detected; consecutive instances are separated by at
+least one background emission.
 """
 struct LoopMode <: ModelMode end
 
+# `(state_type, pattern_idx, position)`; `state_type ∈ (:N, :M, :I)`
 const StateInfo = Tuple{Symbol, Int, Int}
 
 # ============================================================================
@@ -60,12 +64,14 @@ const StateInfo = Tuple{Symbol, Int, Int}
 """
     SegmentHMM{M<:ModelMode, H<:HMM}
 
-Segment detection HMM parameterised by mode `M`.
+Segment-detection HMM parameterised by mode `M`.
 
 # Fields
 - `hmm::H`: underlying HiddenMarkovModels.HMM
-- `states::Vector{StateInfo}`: state metadata `(type, pattern_idx, position)`
-- `pattern_lengths::Vector{Int}`: length of each pattern
+- `states::Vector{StateInfo}`: metadata `(state_type, pattern_idx, position)` per
+  state. `state_type` is `:N` for background, `:M` for a match position, `:I`
+  for an insert position. `pattern_idx == 0` for background.
+- `pattern_lengths::Vector{Int}`: length of each pattern's match track.
 """
 struct SegmentHMM{M<:ModelMode, H<:HMM}
     hmm::H
@@ -92,15 +98,12 @@ uniform_emission(n_symbols::Int) = Categorical(fill(1.0 / n_symbols, n_symbols))
 """
     trim_pmf(len, p_trim) -> Vector{Float64}
 
-Truncated geometric PMF over positions `1:len` representing 5'-trim:
+Truncated geometric PMF over positions `1:len`:
 `P(enter at position j) ∝ p_trim^(j-1)`, normalised.
 
 - `p_trim = 0` puts all mass on position 1 (no trim).
 - `p_trim → 1` approaches uniform.
 - Untruncated mean trim length is `p_trim / (1 - p_trim)`.
-
-Used internally to weight `N → P_{i,j}` entry transitions; the same shape is
-applied (reversed) to `P_{i,j} → N` exits via `p_3trim`.
 """
 function trim_pmf(len::Int, p_trim::Float64)
     0.0 <= p_trim < 1.0 || throw(ArgumentError("p_trim must be in [0, 1)"))
@@ -110,27 +113,99 @@ function trim_pmf(len::Int, p_trim::Float64)
 end
 
 # ============================================================================
+# Profile-HMM block construction
+# ============================================================================
+
+# Fill in transitions, emissions, and state metadata for one profile block at
+# state offset `s` (= index of `M_{i,1}`). Exits go to `exit_state`.
+#
+# Block layout (interleaved): for j = 1..L,
+#   states[s + 2(j-1)]     = M_{i,j}
+#   states[s + 2(j-1) + 1] = I_{i,j}
+#
+# Silent D states are marginalised: `M_j → M_{j+k}` for k ≥ 2 carries the
+# analytic weight `p_md * p_dd^(k-2) * p_dm`. Leakage of the delete chain past
+# the last position is folded into `M_j → exit_state` as effective 3'-trim.
+function _add_profile_block!(trans::Matrix{Float64},
+                             dists::Vector,
+                             states::Vector{StateInfo},
+                             s::Int,
+                             pat::Vector{Int},
+                             pattern_idx::Int,
+                             exit_state::Int,
+                             n_symbols::Int,
+                             match_prob::Float64,
+                             p_3trim::Float64,
+                             p_mi::Float64,
+                             p_md::Float64,
+                             p_ii::Float64,
+                             p_dd::Float64)
+    L = length(pat)
+    p_mm = 1.0 - p_mi - p_md
+    p_im = 1.0 - p_ii
+    p_dm = 1.0 - p_dd
+    enter = 1.0 - p_3trim
+
+    for j in 1:L
+        m_idx = s + 2 * (j - 1)
+        i_idx = m_idx + 1
+
+        states[m_idx] = (:M, pattern_idx, j)
+        states[i_idx] = (:I, pattern_idx, j)
+        dists[m_idx]  = match_emission(pat[j], n_symbols, match_prob)
+        dists[i_idx]  = uniform_emission(n_symbols)
+
+        if j < L
+            trans[m_idx, m_idx + 2] = enter * p_mm                  # → M_{j+1}
+            trans[m_idx, i_idx]     = enter * p_mi                  # → I_j
+            for k in 2:(L - j)                                      # → M_{j+k} via delete chain
+                target = s + 2 * (j + k - 1)
+                trans[m_idx, target] = enter * p_md * p_dd^(k - 2) * p_dm
+            end
+            leakage = p_md * p_dd^(L - j - 1)                        # delete chain falls off the end
+            trans[m_idx, exit_state] = p_3trim + enter * leakage
+
+            trans[i_idx, i_idx]     = p_ii                          # I self-loop (extend)
+            trans[i_idx, m_idx + 2] = p_im                          # I → M_{j+1} (close)
+        else
+            trans[m_idx, i_idx]      = enter * p_mi                 # M_L → I_L
+            trans[m_idx, exit_state] = 1.0 - enter * p_mi           # everything else → exit
+            trans[i_idx, i_idx]      = p_ii                         # I_L self-loop
+            trans[i_idx, exit_state] = p_im                         # I_L → exit
+        end
+    end
+end
+
+# ============================================================================
 # Constructors
 # ============================================================================
 
 """
     SegmentHMM(mode::ModelMode, patterns::Vector{Vector{Int}}; kwargs...)
 
-Construct a segment HMM.
+Construct a segment-detection HMM. Each pattern is realised as a profile-HMM
+block with match, insert, and (silent, marginalised) delete states.
 
 # Arguments
 - `mode`: model topology ([`NullMode`](@ref), [`SingleMode`](@ref), [`LoopMode`](@ref))
-- `patterns`: vector of integer sequences representing patterns
+- `patterns`: vector of integer sequences (the match track of each profile)
 
-# Keyword Arguments
-- `n_symbols=4`: alphabet size
-- `match_prob=0.85`: per-position emission probability for the matching symbol
-- `p_stay_n=0.6` (Single) / `0.75` (Loop): self-loop probability for the background state
-- `p_skip=0.05` (Single only): probability of skipping patterns entirely
-- `p_5trim=0.0`: geometric per-step probability of 5'-trimming the pattern.
-   `0` means entry is always at position 1; values close to 1 approach uniform entry.
-- `p_3trim=0.1` (Single) / `0.05` (Loop): geometric per-step probability of 3'-trim
-   (replaces the old `p_continue`: `p_continue == 1 - p_3trim`).
+# Keyword arguments
+- `n_symbols = 4`: alphabet size.
+- `match_prob = 0.9`: per-position emission probability of the matching symbol
+  at match states; other symbols share the remainder uniformly.
+- `p_stay_n = 0.6` (Single) / `0.75` (Loop): background self-loop probability.
+- `p_skip = 0.05` (Single only): prior probability of no pattern at all.
+- `p_5trim = 0.0`: per-step geometric 5'-trim probability for entry into the
+  profile. `0` = always enter at position 1.
+- `p_3trim = 0.1` (Single) / `0.05` (Loop): per-match-position exit probability
+  to background (geometric 3'-trim).
+- `p_mi = 0.025`: open-insertion probability (M → I).
+- `p_md = 0.025`: open-deletion probability (M → D).
+- `p_ii = 0.3`: insertion-extension probability (I → I).
+- `p_dd = 0.3`: deletion-extension probability (D → D).
+
+Set `p_mi = p_md = 0` to recover a pure match-only model.
 """
 function SegmentHMM(::NullMode, patterns::Vector{Vector{Int}}=Vector{Int}[];
                     n_symbols::Int=4, kwargs...)
@@ -145,69 +220,56 @@ function SegmentHMM(::SingleMode, patterns::Vector{Vector{Int}};
                     p_skip::Float64=0.05,
                     p_5trim::Float64=0.0,
                     p_3trim::Float64=0.1,
-                    match_prob::Float64=0.85)
+                    match_prob::Float64=0.9,
+                    p_mi::Float64=0.025,
+                    p_md::Float64=0.025,
+                    p_ii::Float64=0.3,
+                    p_dd::Float64=0.3)
     isempty(patterns) && throw(ArgumentError("patterns must be non-empty for SingleMode"))
     pat_mass = 1.0 - p_stay_n - p_skip
     pat_mass > 0 || throw(ArgumentError("p_stay_n + p_skip must be < 1"))
+    p_mi + p_md <= 1.0 || throw(ArgumentError("p_mi + p_md must be <= 1"))
+    0 <= p_ii < 1 || throw(ArgumentError("p_ii must be in [0, 1)"))
+    0 <= p_dd < 1 || throw(ArgumentError("p_dd must be in [0, 1)"))
 
     lens = length.(patterns)
     n_pat = length(patterns)
-    total_p = sum(lens)
-    n_states = 2 + total_p
-
-    starts = cumsum([0; lens[1:end-1]]) .+ 2
+    n_states = 2 + 2 * sum(lens)
     n_end = n_states
 
+    starts = Vector{Int}(undef, n_pat)
+    cum = 1
+    for i in 1:n_pat
+        starts[i] = cum + 1
+        cum += 2 * lens[i]
+    end
+
     trans = zeros(n_states, n_states)
-    trans[1, 1] = p_stay_n
-    trans[1, n_end] = p_skip
+    dists = Vector{Categorical{Float64, Vector{Float64}}}(undef, n_states)
+    states = Vector{StateInfo}(undef, n_states)
+
+    states[1] = (:N, 0, 0)
+    states[n_end] = (:N, 0, 0)
+    dists[1] = uniform_emission(n_symbols)
+    dists[n_end] = uniform_emission(n_symbols)
+
+    trans[1, 1]      = p_stay_n
+    trans[1, n_end]  = p_skip
+    trans[n_end, n_end] = 1.0
 
     for (i, pat) in enumerate(patterns)
         s = starts[i]
         pmf = trim_pmf(length(pat), p_5trim)
         for j in 1:length(pat)
-            trans[1, s + j - 1] = pat_mass * pmf[j] / n_pat
+            trans[1, s + 2 * (j - 1)] = pat_mass * pmf[j] / n_pat
         end
-    end
-
-    for (i, pat) in enumerate(patterns)
-        s = starts[i]
-        L = length(pat)
-        for j in 1:L
-            cur = s + j - 1
-            if j < L
-                trans[cur, cur + 1] = 1.0 - p_3trim
-                trans[cur, n_end] = p_3trim
-            else
-                trans[cur, n_end] = 1.0
-            end
-        end
-    end
-    trans[n_end, n_end] = 1.0
-
-    dists = Vector{Categorical{Float64, Vector{Float64}}}(undef, n_states)
-    dists[1] = uniform_emission(n_symbols)
-    dists[n_end] = uniform_emission(n_symbols)
-    for (i, pat) in enumerate(patterns)
-        s = starts[i]
-        for (j, sym) in enumerate(pat)
-            dists[s + j - 1] = match_emission(sym, n_symbols, match_prob)
-        end
-    end
-
-    states = Vector{StateInfo}(undef, n_states)
-    states[1] = (:N, 0, 0)
-    states[n_end] = (:N, 0, 0)
-    for (i, pat) in enumerate(patterns)
-        s = starts[i]
-        for j in 1:length(pat)
-            states[s + j - 1] = (:P, i, j)
-        end
+        _add_profile_block!(trans, dists, states, s, pat, i, n_end,
+                            n_symbols, match_prob, p_3trim,
+                            p_mi, p_md, p_ii, p_dd)
     end
 
     init = zeros(n_states)
     init[1] = 1.0
-
     hmm = HMM(init, trans, dists)
     SegmentHMM{SingleMode, typeof(hmm)}(hmm, states, lens)
 end
@@ -217,64 +279,50 @@ function SegmentHMM(::LoopMode, patterns::Vector{Vector{Int}};
                     p_stay_n::Float64=0.75,
                     p_5trim::Float64=0.0,
                     p_3trim::Float64=0.05,
-                    match_prob::Float64=0.85)
+                    match_prob::Float64=0.9,
+                    p_mi::Float64=0.025,
+                    p_md::Float64=0.025,
+                    p_ii::Float64=0.3,
+                    p_dd::Float64=0.3)
     isempty(patterns) && throw(ArgumentError("patterns must be non-empty for LoopMode"))
     pat_mass = 1.0 - p_stay_n
     pat_mass > 0 || throw(ArgumentError("p_stay_n must be < 1"))
+    p_mi + p_md <= 1.0 || throw(ArgumentError("p_mi + p_md must be <= 1"))
+    0 <= p_ii < 1 || throw(ArgumentError("p_ii must be in [0, 1)"))
+    0 <= p_dd < 1 || throw(ArgumentError("p_dd must be in [0, 1)"))
 
     lens = length.(patterns)
     n_pat = length(patterns)
-    total_p = sum(lens)
-    n_states = 1 + total_p
+    n_states = 1 + 2 * sum(lens)
 
-    starts = cumsum([0; lens[1:end-1]]) .+ 2
+    starts = Vector{Int}(undef, n_pat)
+    cum = 1
+    for i in 1:n_pat
+        starts[i] = cum + 1
+        cum += 2 * lens[i]
+    end
 
     trans = zeros(n_states, n_states)
+    dists = Vector{Categorical{Float64, Vector{Float64}}}(undef, n_states)
+    states = Vector{StateInfo}(undef, n_states)
+
+    states[1] = (:N, 0, 0)
+    dists[1]  = uniform_emission(n_symbols)
     trans[1, 1] = p_stay_n
 
     for (i, pat) in enumerate(patterns)
         s = starts[i]
         pmf = trim_pmf(length(pat), p_5trim)
         for j in 1:length(pat)
-            trans[1, s + j - 1] = pat_mass * pmf[j] / n_pat
+            trans[1, s + 2 * (j - 1)] = pat_mass * pmf[j] / n_pat
         end
-    end
-
-    for (i, pat) in enumerate(patterns)
-        s = starts[i]
-        L = length(pat)
-        for j in 1:L
-            cur = s + j - 1
-            if j < L
-                trans[cur, cur + 1] = 1.0 - p_3trim
-                trans[cur, 1] = p_3trim
-            else
-                trans[cur, 1] = 1.0
-            end
-        end
-    end
-
-    dists = Vector{Categorical{Float64, Vector{Float64}}}(undef, n_states)
-    dists[1] = uniform_emission(n_symbols)
-    for (i, pat) in enumerate(patterns)
-        s = starts[i]
-        for (j, sym) in enumerate(pat)
-            dists[s + j - 1] = match_emission(sym, n_symbols, match_prob)
-        end
-    end
-
-    states = Vector{StateInfo}(undef, n_states)
-    states[1] = (:N, 0, 0)
-    for (i, pat) in enumerate(patterns)
-        s = starts[i]
-        for j in 1:length(pat)
-            states[s + j - 1] = (:P, i, j)
-        end
+        _add_profile_block!(trans, dists, states, s, pat, i, 1,
+                            n_symbols, match_prob, p_3trim,
+                            p_mi, p_md, p_ii, p_dd)
     end
 
     init = zeros(n_states)
     init[1] = 1.0
-
     hmm = HMM(init, trans, dists)
     SegmentHMM{LoopMode, typeof(hmm)}(hmm, states, lens)
 end
@@ -300,9 +348,8 @@ HiddenMarkovModels.viterbi(m::SegmentHMM, obs) = viterbi(m.hmm, obs)
 """
     forward_backward(m::SegmentHMM, obs) -> (γ, logL)
 
-Posterior state marginals. `γ[s, t]` is `P(state_t = s | obs)`.
-Aggregate rows by pattern (using `m.states`) for per-pattern occupancy at each
-position.
+Posterior state marginals. `γ[s, t]` is `P(state_t = s | obs)`. Aggregate by
+pattern using `m.states[s][2]` to obtain per-pattern occupancy per position.
 """
 HiddenMarkovModels.forward_backward(m::SegmentHMM, obs) = forward_backward(m.hmm, obs)
 
@@ -316,7 +363,7 @@ HiddenMarkovModels.forward_backward(m::SegmentHMM, obs) = forward_backward(m.hmm
 Decoded segment from Viterbi path.
 
 # Fields
-- `type::Symbol`: `:N` (background) or `:P` (pattern)
+- `type::Symbol`: `:N` (background) or `:P` (pattern; collapses `:M` and `:I` states)
 - `pattern::Int`: pattern index (`0` for background)
 - `start::Int`: start position in observation (inclusive)
 - `stop::Int`: end position in observation (inclusive)
@@ -328,34 +375,32 @@ struct Segment
     stop::Int
 end
 
+@inline _segment_key(info::StateInfo) = (info[1] === :N ? :N : :P, info[2])
+
 """
     decode(m::SegmentHMM, obs) -> Vector{Segment}
 
-Decode `obs` into segments using Viterbi. Adjacent occurrences of the same
-pattern are kept as separate segments by detecting a reset in pattern position.
+Decode `obs` into segments via Viterbi. Match and insert states of a profile
+collapse into a single `:P` segment for the corresponding pattern. Adjacent
+occurrences of the same pattern (separated by background) are returned as
+distinct segments.
 """
 function decode(m::SegmentHMM, obs::AbstractVector{<:Integer})
     isempty(obs) && return Segment[]
     path, _ = viterbi(m.hmm, obs)
 
     segments = Segment[]
-    typ, pat, pos = m.states[path[1]]
+    cur = _segment_key(m.states[path[1]])
     seg_start = 1
-
     for i in 2:length(path)
-        t, p, q = m.states[path[i]]
-        # New segment if (type, pattern) changes, or if within a pattern the
-        # position does not advance by 1 (i.e. re-entry into the same pattern).
-        new_seg = (t, p) != (typ, pat) || (t === :P && q != pos + 1)
-        if new_seg
-            push!(segments, Segment(typ, pat, seg_start, i - 1))
-            typ, pat = t, p
+        k = _segment_key(m.states[path[i]])
+        if k != cur
+            push!(segments, Segment(cur[1], cur[2], seg_start, i - 1))
+            cur = k
             seg_start = i
         end
-        pos = q
     end
-    push!(segments, Segment(typ, pat, seg_start, length(path)))
-
+    push!(segments, Segment(cur[1], cur[2], seg_start, length(path)))
     segments
 end
 
@@ -363,21 +408,21 @@ end
 # Show
 # ============================================================================
 
-mode_name(::Type{NullMode}) = "Null"
+mode_name(::Type{NullMode})   = "Null"
 mode_name(::Type{SingleMode}) = "Single"
-mode_name(::Type{LoopMode}) = "Loop"
+mode_name(::Type{LoopMode})   = "Loop"
 
 function Base.show(io::IO, ::MIME"text/plain", m::SegmentHMM{M}) where M
     np = length(m.pattern_lengths)
     ns = length(m.states)
-    println(io, "SegmentHMM{$(mode_name(M))} with $np patterns, $ns states")
+    println(io, "SegmentHMM{$(mode_name(M))} with $np patterns, $ns states (profile HMM)")
 
     if M === NullMode
         println(io, "  N ⟲")
     elseif M === SingleMode
-        println(io, "  N₀ ⟲ → Pᵢ → N₁ ⟲")
+        println(io, "  N₀ ⟲ → profileᵢ → N₁ ⟲")
     elseif M === LoopMode
-        println(io, "  N ⟲ ⇄ Pᵢ")
+        println(io, "  N ⟲ ⇄ profileᵢ")
     end
 
     np > 0 || return

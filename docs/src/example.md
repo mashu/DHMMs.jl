@@ -62,32 +62,37 @@ rc_patterns = [seq_to_ints(reverse_complement(g)) for g in d_genes]
 all_patterns = vcat(patterns, rc_patterns)
 ```
 
-## Building models with trim priors
+## Building models with trim and indel priors
 
-Expressed Ds are trimmed by exonucleases on both ends. Trim length is
-approximately geometric with mean 2–5 nt. Set `p_5trim` and `p_3trim` so the
-mean trim under the model matches your prior: `E[trim] = p / (1 - p)`, so
-`p = 0.75` ↔ mean 3 nt, `p = 0.8` ↔ mean 4 nt.
+Each pattern in DHMMs is a profile-HMM block with match, insert, and (silent,
+marginalised) delete states, so divergent D genes and rare indels are absorbed
+by the model rather than ruining the score.
+
+- `match_prob` is the per-position match probability — keep it high (0.9–0.95)
+  and let the dedicated parameters handle trim and indels.
+- `p_5trim` / `p_3trim` are geometric trim priors (mean trim = `p / (1 - p)`):
+  `p = 0.75` ↔ mean 3 nt, `p = 0.8` ↔ mean 4 nt.
+- `p_mi` / `p_md` are per-position open-insertion / open-deletion probabilities;
+  defaults `0.025` are typical of profile-HMM priors. Set both to `0` to fall
+  back to a pure match-only model.
+- `p_ii` / `p_dd` are insertion- / deletion-extension probabilities (geometric
+  indel length, mean length = `1 / (1 - p)`).
 
 ```julia
-# Background-only null
 m_null = SegmentHMM(NullMode())
 
-# Single-D model: at most one D, both ends trimmable
 m_single = SegmentHMM(SingleMode(), all_patterns;
     p_stay_n=0.6, p_skip=0.05,
     p_5trim=0.75, p_3trim=0.75,
-    match_prob=0.9)
+    match_prob=0.9,
+    p_mi=0.025, p_md=0.025, p_ii=0.3, p_dd=0.3)
 
-# Multi-D model: zero, one, or more Ds, separated by N-additions
 m_loop = SegmentHMM(LoopMode(), all_patterns;
     p_stay_n=0.85,
     p_5trim=0.75, p_3trim=0.75,
-    match_prob=0.9)
+    match_prob=0.9,
+    p_mi=0.025, p_md=0.025, p_ii=0.3, p_dd=0.3)
 ```
-
-`match_prob` should reflect substitution rate, not trim rate — keep it high
-(0.9–0.95) and let `p_5trim`/`p_3trim` absorb the trimming.
 
 ## Scoring a CDR3
 
@@ -135,7 +140,7 @@ track:
 n_pat = length(all_patterns)
 p_per_d = zeros(n_pat, length(obs))
 for (s, info) in enumerate(m_loop.states)
-    info[1] === :P || continue
+    (info[1] === :M || info[1] === :I) || continue
     p_per_d[info[2], :] .+= γ[s, :]
 end
 # p_per_d[i, t] = P(position t is inside D_i)
