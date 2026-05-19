@@ -1,7 +1,8 @@
 using Test
 using DHMMs
 using DHMMs: trim_pmf
-using HiddenMarkovModels: logdensityof, viterbi, forward_backward
+using HiddenMarkovModels: HMM, logdensityof, viterbi, forward_backward
+using SparseArrays: SparseMatrixCSC, nnz
 
 @testset "DHMMs" begin
     patterns = [[1, 2, 3], [3, 3, 1, 2]]  # ACG and GGAC
@@ -83,10 +84,38 @@ using HiddenMarkovModels: logdensityof, viterbi, forward_backward
         for m in (SegmentHMM(NullMode(), patterns),
                   SegmentHMM(SingleMode(), patterns; p_5trim=0.5),
                   SegmentHMM(LoopMode(), patterns; p_5trim=0.7),
-                  SegmentHMM(LoopMode(), patterns; p_mi=0.1, p_md=0.1, p_ii=0.4, p_dd=0.4))
+                  SegmentHMM(LoopMode(), patterns; p_mi=0.1, p_md=0.1, p_ii=0.4, p_dd=0.4),
+                  SegmentHMM(LoopMode(), patterns; p_direct=0.1, p_5trim=0.0),
+                  SegmentHMM(LoopMode(), patterns; p_direct=0.2, p_5trim=0.5))
             row_sums = sum(m.hmm.trans; dims=2)
             @test all(s -> isapprox(s, 1.0; atol=1e-10), row_sums)
         end
+    end
+
+    @testset "Transition matrix is stored sparsely" begin
+        for m in (SegmentHMM(NullMode(), patterns),
+                  SegmentHMM(SingleMode(), patterns),
+                  SegmentHMM(LoopMode(), patterns),
+                  SegmentHMM(LoopMode(), patterns; p_direct=0.1))
+            @test m.hmm.trans isa SparseMatrixCSC
+            # At default settings, the profile topology has O(L) non-zeros per
+            # state, far below the dense N² that would be n_states^2.
+            @test nnz(m.hmm.trans) < length(m.hmm.trans)
+        end
+    end
+
+    @testset "Sparse storage matches dense semantics" begin
+        # Round-trip through full() should reproduce the same probabilities
+        # and the same Viterbi result for the same observation.
+        m   = SegmentHMM(LoopMode(), patterns; p_mi=0.05, p_md=0.05)
+        obs = [4, 4, 1, 2, 3, 4, 4]
+        ll1 = logdensityof(m, obs)
+        path1, vl1 = viterbi(m, obs)
+        dense_hmm = HMM(m.hmm.init, Matrix(m.hmm.trans), m.hmm.dists)
+        @test isapprox(ll1, logdensityof(dense_hmm, obs); atol=1e-10)
+        path2, vl2 = viterbi(dense_hmm, obs)
+        @test path1 == path2
+        @test isapprox(vl1, vl2; atol=1e-10)
     end
 
     @testset "Internal-delete transitions exist when p_md > 0" begin
@@ -219,6 +248,35 @@ using HiddenMarkovModels: logdensityof, viterbi, forward_backward
         # 5'-trim of 1 → entry at profile position 2; full traversal to position 5.
         @test p_segs[1].profile_start == 2
         @test p_segs[1].profile_stop == 5
+    end
+
+    @testset "p_direct allows direct profile→profile transitions" begin
+        # With p_direct = 0, every exit from a profile goes to N. With
+        # p_direct > 0, exits also feed back into pattern entries.
+        m_no_direct   = SegmentHMM(LoopMode(), patterns; p_direct=0.0)
+        m_with_direct = SegmentHMM(LoopMode(), patterns; p_direct=0.2)
+        # M_{1,3} (state 6) terminal: exits all go to N when p_direct = 0.
+        @test m_no_direct.hmm.trans[6, 8]  == 0   # no direct to M_{2,1}
+        @test m_with_direct.hmm.trans[6, 8] > 0   # has direct mass into M_{2,1}
+        @test m_with_direct.hmm.trans[6, 2] > 0   # direct self-restart at M_{1,1}
+    end
+
+    @testset "decode splits back-to-back patterns under p_direct" begin
+        # Two ACG copies with NO background between them. Without p_direct the
+        # Viterbi path must insert an N step, fragmenting the second copy.
+        # With p_direct, the path can chain M_{1,3} → M_{1,1} directly.
+        pats = [[1, 2, 3]]
+        obs  = [4, 1, 2, 3, 1, 2, 3]  # T then ACG-ACG, no spacer
+        m = SegmentHMM(LoopMode(), pats;
+                       p_stay_n=0.3, p_3trim=0.001,
+                       match_prob=0.999, p_mi=0.0, p_md=0.0,
+                       p_direct=0.95)
+        segs = decode(m, obs)
+        p_segs = filter(s -> s.type === :P, segs)
+        @test length(p_segs) == 2
+        @test (p_segs[1].start, p_segs[1].stop) == (2, 4)
+        @test (p_segs[2].start, p_segs[2].stop) == (5, 7)
+        @test all(s -> (s.profile_start, s.profile_stop) == (1, 3), p_segs)
     end
 
     @testset "CDR3-style detection: two D segments in one read" begin

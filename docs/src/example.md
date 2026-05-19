@@ -91,8 +91,14 @@ m_loop = SegmentHMM(LoopMode(), all_patterns;
     p_stay_n=0.85,
     p_5trim=0.75, p_3trim=0.75,
     match_prob=0.9,
-    p_mi=0.025, p_md=0.025, p_ii=0.3, p_dd=0.3)
+    p_mi=0.025, p_md=0.025, p_ii=0.3, p_dd=0.3,
+    p_direct=0.0)  # raise to allow D-D without intervening N-additions
 ```
+
+Set `p_direct > 0` if you want the model to admit back-to-back Ds with no
+intervening N-additions (rare D-D fusion-style joints). Direct entries respect
+the same `p_5trim` prior used by `N → profile` entries, so trimming is
+modelled symmetrically.
 
 ## Scoring a CDR3
 

@@ -13,7 +13,14 @@ detected and scored. Built on
 |------|----------|-----|
 | [`NullMode`](@ref)   | `N ⟲`                          | Background-only null for Bayes-factor comparisons |
 | [`SingleMode`](@ref) | `N₀ ⟲ → profileᵢ → N₁ ⟲`      | At most one (possibly trimmed, indel-bearing) pattern instance |
-| [`LoopMode`](@ref)   | `N ⟲ ⇄ profileᵢ`              | Zero, one, or many instances; separated by background |
+| [`LoopMode`](@ref)   | `N ⟲ ⇄ profileᵢ`              | Zero, one, or many instances; separated by background, or chained directly under `p_direct > 0` |
+
+## Performance
+
+Transition matrices are stored as `SparseMatrixCSC` and Viterbi /
+forward / forward-backward dispatch to HiddenMarkovModels.jl's sparse
+`argmaxplus_transmul!`, iterating only over the `O(L)` non-zero out-edges
+per state instead of all `O(n_states)` columns.
 
 ## Statistical model
 
