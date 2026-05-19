@@ -162,16 +162,77 @@ Two adjacent occurrences of the same D are returned as two `Segment`s.
 
 ## Calibrating significance via shuffle
 
-The log-odds above has no closed-form null. The standard fix is to compare to
-the same statistic on shuffled versions of the read:
+The log-odds above has no closed-form null. Compare against the same statistic
+on randomly resampled versions of the read. For DNA (and CDR3 in particular) a
+mononucleotide shuffle is anti-conservative because it destroys the
+dinucleotide composition: real reads have GC-rich runs, suppressed `CG`, and
+hot/cold-spot motifs that an `AAAA…CCCC…GGGG…TTTT…` null does not capture, so
+the null score distribution drifts low and p-values shrink. Use a
+**dinucleotide-preserving** shuffle instead.
+
+The implementation below generates a random Eulerian trail through the
+dinucleotide graph of `obs` (Altschul & Erickson, 1985), producing a sequence
+with exactly the same dinucleotide composition and the same endpoints:
 
 ```julia
-function null_quantile(obs, m_single, m_null; B=200, rng=Random.default_rng())
-    obs_score = logdensityof(m_single, obs) - logdensityof(m_null, obs)
-    null_scores = map(1:B) do _
-        sh = shuffle(rng, obs)
-        logdensityof(m_single, sh) - logdensityof(m_null, sh)
+using Random
+
+function dinucleotide_shuffle(obs::AbstractVector{<:Integer};
+                              rng=Random.default_rng())
+    n = length(obs)
+    n < 3 && return collect(obs)
+    A = maximum(obs)
+    out_edges = [Int[] for _ in 1:A]
+    for i in 1:n-1
+        push!(out_edges[obs[i]], obs[i+1])
     end
+    root = obs[end]
+    while true
+        # Randomly permute each vertex's out-edges; the last one becomes its
+        # "exit" edge towards the root.
+        edges = [shuffle(rng, copy(e)) for e in out_edges]
+        last_edge = fill(0, A)
+        for v in 1:A
+            v == root && continue
+            isempty(edges[v]) || (last_edge[v] = edges[v][end])
+        end
+        # Reject unless the exit edges form an arborescence rooted at `root`
+        # (BEST-theorem condition for the trail to be Eulerian).
+        ok = true
+        for v in 1:A
+            v == root && continue
+            last_edge[v] == 0 && continue
+            u, seen = v, falses(A)
+            while u != root
+                if seen[u] || last_edge[u] == 0
+                    ok = false; break
+                end
+                seen[u] = true
+                u = last_edge[u]
+            end
+            ok || break
+        end
+        ok || continue
+        # Greedy walk over the now-valid shuffled edge lists.
+        out = Vector{eltype(obs)}(undef, n)
+        out[1] = obs[1]
+        v = obs[1]
+        for i in 2:n
+            w = popfirst!(edges[v])
+            out[i] = w
+            v = w
+        end
+        return out
+    end
+end
+
+function null_quantile(obs, m_single, m_null;
+                       B::Int=200,
+                       shuffle_fn=dinucleotide_shuffle,
+                       rng=Random.default_rng())
+    score(o) = logdensityof(m_single, o) - logdensityof(m_null, o)
+    obs_score = score(obs)
+    null_scores = [score(shuffle_fn(obs; rng=rng)) for _ in 1:B]
     p = (1 + count(>=(obs_score), null_scores)) / (B + 1)
     obs_score, p
 end
@@ -179,9 +240,10 @@ end
 score, p = null_quantile(obs, m_single, m_null)
 ```
 
-For more realistic null preservation of dinucleotide composition, shuffle
-dinucleotides rather than single nucleotides; the package leaves this choice to
-you.
+For very short reads (≲ 30 nt) the dinucleotide graph is sparse and the
+rejection step above may need many tries; this is rare in practice for CDR3
+work. If you have reasons to prefer mononucleotide shuffling, pass
+`shuffle_fn = obs -> shuffle(obs)` explicitly.
 
 ## Negative control
 
