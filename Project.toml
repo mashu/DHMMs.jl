@@ -1,16 +1,19 @@
 name = "DHMMs"
 uuid = "871b1990-e9db-4005-9c80-f6dd9624f7c1"
 authors = ["Mateusz Kaduk <mateusz.kaduk@gmail.com>"]
-version = "0.1.0"
+version = "0.6.0"
 
 [deps]
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 HiddenMarkovModels = "84ca31d5-effc-45e0-bfda-5a68cd981f47"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [compat]
 julia = "1.10"
 Distributions = "0.25"
 HiddenMarkovModels = "0.7"
+PrecompileTools = "1"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
