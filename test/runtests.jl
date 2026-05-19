@@ -174,16 +174,71 @@ using HiddenMarkovModels: logdensityof, viterbi, forward_backward
     end
 
     @testset "Decode separates adjacent same-pattern hits" begin
+        # init forces N at position 1, so the first hit starts at position 2.
         pats = [[1, 2, 3]]
-        obs = [1, 2, 3, 4, 1, 2, 3]  # ACG T ACG
+        obs = [4, 1, 2, 3, 4, 1, 2, 3]  # T ACG T ACG
         m = SegmentHMM(LoopMode(), pats;
                        p_stay_n=0.4, p_3trim=0.01, match_prob=0.99,
                        p_mi=0.0, p_md=0.0)
         segs = decode(m, obs)
         p_segs = filter(s -> s.type === :P && s.pattern == 1, segs)
         @test length(p_segs) == 2
-        @test p_segs[1].start == 1 && p_segs[1].stop == 3
-        @test p_segs[2].start == 5 && p_segs[2].stop == 7
+        @test (p_segs[1].start, p_segs[1].stop) == (2, 4)
+        @test (p_segs[2].start, p_segs[2].stop) == (6, 8)
+        @test all(s -> s.profile_start == 1 && s.profile_stop == 3, p_segs)
+    end
+
+    @testset "CDR3-style detection: D in the middle of a flanked read" begin
+        # V-flank + D + J-flank, with D fully present (no trim).
+        pats = [[1, 2, 3, 4]]                         # D = ACGT
+        obs  = [4, 4, 4, 4, 1, 2, 3, 4, 1, 1, 1, 1]    # TTTT ACGT AAAA
+        m = SegmentHMM(LoopMode(), pats;
+                       p_stay_n=0.85, p_3trim=0.05, match_prob=0.99,
+                       p_mi=0.0, p_md=0.0)
+        segs = decode(m, obs)
+        @test segs[1].type === :N && segs[1].start == 1 && segs[1].stop == 4
+        p_segs = filter(s -> s.type === :P, segs)
+        @test length(p_segs) == 1
+        @test p_segs[1].start == 5 && p_segs[1].stop == 8
+        @test p_segs[1].profile_start == 1
+        @test p_segs[1].profile_stop == 4
+        @test segs[end].type === :N && segs[end].stop == length(obs)
+    end
+
+    @testset "CDR3-style detection: 5'-trimmed D in the middle" begin
+        # True D = GACGT (length 5); expressed as ACGT (5'-G trimmed).
+        pats = [[3, 1, 2, 3, 4]]                       # GACGT
+        obs  = [4, 4, 4, 4, 1, 2, 3, 4, 1, 1, 1, 1]    # TTTT ACGT AAAA
+        m = SegmentHMM(LoopMode(), pats;
+                       p_stay_n=0.85, p_5trim=0.75, p_3trim=0.05,
+                       match_prob=0.99, p_mi=0.0, p_md=0.0)
+        segs = decode(m, obs)
+        p_segs = filter(s -> s.type === :P, segs)
+        @test length(p_segs) == 1
+        @test p_segs[1].start == 5 && p_segs[1].stop == 8
+        # 5'-trim of 1 → entry at profile position 2; full traversal to position 5.
+        @test p_segs[1].profile_start == 2
+        @test p_segs[1].profile_stop == 5
+    end
+
+    @testset "CDR3-style detection: two D segments in one read" begin
+        # V-flank + D1 + N-additions + D2 + J-flank.
+        pats = [[1, 2, 3], [3, 3, 1, 2]]               # ACG, GGAC
+        obs  = [4, 4,                                  # V-flank
+                1, 2, 3,                               # D1 = ACG
+                4, 4,                                  # N-additions
+                3, 3, 1, 2,                            # D2 = GGAC
+                1, 1, 1]                               # J-flank
+        m = SegmentHMM(LoopMode(), pats;
+                       p_stay_n=0.6, p_3trim=0.05, match_prob=0.99,
+                       p_mi=0.0, p_md=0.0)
+        segs = decode(m, obs)
+        p_segs = filter(s -> s.type === :P, segs)
+        @test length(p_segs) == 2
+        @test (p_segs[1].pattern, p_segs[1].start, p_segs[1].stop,
+               p_segs[1].profile_start, p_segs[1].profile_stop) == (1, 3, 5, 1, 3)
+        @test (p_segs[2].pattern, p_segs[2].start, p_segs[2].stop,
+               p_segs[2].profile_start, p_segs[2].profile_stop) == (2, 8, 11, 1, 4)
     end
 
     @testset "forward_backward delegation" begin

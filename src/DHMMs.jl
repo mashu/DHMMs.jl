@@ -365,42 +365,71 @@ Decoded segment from Viterbi path.
 # Fields
 - `type::Symbol`: `:N` (background) or `:P` (pattern; collapses `:M` and `:I` states)
 - `pattern::Int`: pattern index (`0` for background)
-- `start::Int`: start position in observation (inclusive)
+- `start::Int`: start position in observation (1-based, inclusive)
 - `stop::Int`: end position in observation (inclusive)
+- `profile_start::Int`: first profile position visited within the pattern
+  (1-based, inclusive); `0` for background segments. Implies 5'-trim of
+  `profile_start - 1`.
+- `profile_stop::Int`: last profile position visited (inclusive); `0` for
+  background segments. With `pattern_lengths[pattern]`, gives 3'-trim of
+  `pattern_lengths[pattern] - profile_stop`.
 """
 struct Segment
     type::Symbol
     pattern::Int
     start::Int
     stop::Int
+    profile_start::Int
+    profile_stop::Int
+end
+
+function Base.show(io::IO, s::Segment)
+    if s.type === :N
+        print(io, "Segment(N, obs ", s.start, "-", s.stop, ")")
+    else
+        print(io, "Segment(P", s.pattern,
+              " profile ", s.profile_start, "-", s.profile_stop,
+              ", obs ", s.start, "-", s.stop, ")")
+    end
 end
 
 @inline _segment_key(info::StateInfo) = (info[1] === :N ? :N : :P, info[2])
+@inline _profile_pos(info::StateInfo) = info[1] === :N ? 0 : info[3]
 
 """
     decode(m::SegmentHMM, obs) -> Vector{Segment}
 
 Decode `obs` into segments via Viterbi. Match and insert states of a profile
-collapse into a single `:P` segment for the corresponding pattern. Adjacent
-occurrences of the same pattern (separated by background) are returned as
-distinct segments.
+collapse into a single `:P` segment for the corresponding pattern; the
+`profile_start` / `profile_stop` fields report which positions of the profile
+were visited (so 5'- and 3'-trim are recoverable from a single segment).
+Adjacent occurrences of the same pattern (separated by background) are
+returned as distinct segments.
 """
 function decode(m::SegmentHMM, obs::AbstractVector{<:Integer})
     isempty(obs) && return Segment[]
     path, _ = viterbi(m.hmm, obs)
 
     segments = Segment[]
-    cur = _segment_key(m.states[path[1]])
+    info = m.states[path[1]]
+    cur = _segment_key(info)
     seg_start = 1
+    seg_pstart = _profile_pos(info)
+    seg_pstop  = seg_pstart
     for i in 2:length(path)
-        k = _segment_key(m.states[path[i]])
+        info = m.states[path[i]]
+        k = _segment_key(info)
         if k != cur
-            push!(segments, Segment(cur[1], cur[2], seg_start, i - 1))
+            push!(segments, Segment(cur[1], cur[2], seg_start, i - 1, seg_pstart, seg_pstop))
             cur = k
             seg_start = i
+            seg_pstart = _profile_pos(info)
+            seg_pstop  = seg_pstart
+        elseif info[1] !== :N
+            seg_pstop = info[3]
         end
     end
-    push!(segments, Segment(cur[1], cur[2], seg_start, length(path)))
+    push!(segments, Segment(cur[1], cur[2], seg_start, length(path), seg_pstart, seg_pstop))
     segments
 end
 

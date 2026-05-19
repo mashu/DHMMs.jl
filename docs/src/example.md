@@ -156,14 +156,28 @@ segments = decode(m_loop, obs)
 for seg in segments
     region = String(cdr3[seg.start:seg.stop])
     if seg.type === :P
-        println("D$(seg.pattern): $region ($(seg.start)-$(seg.stop))")
+        L = m_loop.pattern_lengths[seg.pattern]
+        trim5 = seg.profile_start - 1
+        trim3 = L - seg.profile_stop
+        println("D$(seg.pattern): $region (obs $(seg.start)-$(seg.stop), ",
+                "profile $(seg.profile_start)-$(seg.profile_stop)/$L, ",
+                "5'-trim=$trim5, 3'-trim=$trim3)")
     else
-        println("N: $region ($(seg.start)-$(seg.stop))")
+        println("N: $region (obs $(seg.start)-$(seg.stop))")
     end
 end
 ```
 
-Two adjacent occurrences of the same D are returned as two `Segment`s.
+Each `:P` segment carries the profile-coordinate range it covered, so the
+5'- and 3'-trim relative to the reference D are recoverable from a single
+`Segment` (no need to walk the Viterbi path). Two adjacent occurrences of the
+same D are returned as two `Segment`s.
+
+The model assumes the read starts in background (`init[N] = 1`): position 1
+of the input is treated as V-derived (or other flanking) nucleotide, never as
+the first position of a D. This matches the CDR3 layout
+*V-flank–N-additions–D–N-additions–J-flank* and means D segments are always
+returned as internal segments, not pinned to position 1.
 
 ## Calibrating significance via shuffle
 
